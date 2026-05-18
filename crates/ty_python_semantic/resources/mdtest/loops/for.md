@@ -57,6 +57,13 @@ for descending in range(3, 0, -1):
     pass
 
 reveal_type(descending)  # revealed: int
+
+count = 42
+
+for from_count in range(count):
+    pass
+
+reveal_type(from_count)  # revealed: int
 ```
 
 ## With shadowed `range`
@@ -1470,7 +1477,10 @@ reveal_type(loop_only)  # revealed: int
 def random() -> bool:
     return False
 
-count = 1_000_000
+def dynamic_count() -> int:
+    return 1_000_000
+
+count = dynamic_count()
 x = "A"
 for _ in range(count):
     reveal_type(x)  # revealed: Literal["A", "D"]
@@ -1546,7 +1556,10 @@ On the other hand, if `x` is defined before the loop, the `del` makes it a
 `[possibly-unresolved-reference]`:
 
 ```py
-count = 1_000_000
+def dynamic_count() -> int:
+    return 1_000_000
+
+count = dynamic_count()
 x = 0
 for _ in range(count):
     x  # error: [possibly-unresolved-reference]
@@ -1557,7 +1570,10 @@ for _ in range(count):
 ### `del` in a loop makes a variable possibly-unbound after the loop
 
 ```py
-count = 1_000_000
+def dynamic_count() -> int:
+    return 1_000_000
+
+count = dynamic_count()
 x = 0
 for _ in range(count):
     # error: [possibly-unresolved-reference]
@@ -1569,7 +1585,10 @@ x
 ### Bindings in a loop are possibly-unbound after the loop
 
 ```py
-count = 1_000_000
+def dynamic_count() -> int:
+    return 1_000_000
+
+count = dynamic_count()
 for _ in range(count):
     x = 42
 # error: [possibly-unresolved-reference]
