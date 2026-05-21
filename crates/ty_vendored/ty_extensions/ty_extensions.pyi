@@ -294,8 +294,18 @@ class NamedTupleLike(Protocol):
     if sys.version_info >= (3, 13):
         def __replace__(self, *args, **kwargs) -> Self: ...
 
+# Special variants of the corresponding protocols in `typing`, but without the
+# `__iter__`/`__aiter__` on Iterator/AsyncIterator, which is often omitted in
+# practice. These protocols are used for generating better `non-iterable` error
+# messages, nothing else.
 class Iterator[T](Protocol):
     def __next__(self) -> T: ...
 
 class Iterable[T](Protocol):
     def __iter__(self) -> Iterator[T]: ...
+
+class AsyncIterator[T](Protocol):
+    async def __anext__(self) -> T: ...
+
+class AsyncIterable[T](Protocol):
+    def __aiter__(self) -> AsyncIterator[T]: ...

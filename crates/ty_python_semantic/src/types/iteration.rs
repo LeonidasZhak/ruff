@@ -612,7 +612,7 @@ impl<'db> IterationError<'db> {
 
                 if add_error_context {
                     let target = if self.mode.is_async() {
-                        KnownClass::AsyncIterator.to_instance_unknown(self.db)
+                        KnownClass::TyExtensionsAsyncIterable.to_instance_unknown(self.db)
                     } else {
                         KnownClass::TyExtensionsIterable.to_instance_unknown(self.db)
                     };
@@ -641,7 +641,7 @@ impl<'db> IterationError<'db> {
 
                 if add_error_context {
                     let target = if self.mode.is_async() {
-                        KnownClass::AsyncIterator.to_instance_unknown(self.db)
+                        KnownClass::TyExtensionsAsyncIterable.to_instance_unknown(self.db)
                     } else {
                         KnownClass::TyExtensionsIterable.to_instance_unknown(self.db)
                     };
