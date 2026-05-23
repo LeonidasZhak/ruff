@@ -34,6 +34,7 @@ pub(crate) use self::infer::{
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
 pub(crate) use self::relation_error::{ErrorContext, ErrorContextTree, ParameterDescription};
+pub(crate) use self::sequence_pattern::{exact_sequence_pattern_type, sequence_pattern_type};
 use self::set_theoretic::KnownUnion;
 pub(crate) use self::set_theoretic::builder::{
     IntersectionBuilder, UnionAccumulator, UnionBuilder,
@@ -134,6 +135,7 @@ mod overrides;
 mod protocol_class;
 pub(crate) mod relation;
 mod relation_error;
+mod sequence_pattern;
 mod set_theoretic;
 mod signatures;
 mod special_form;
@@ -1684,6 +1686,15 @@ impl<'db> Type<'db> {
     /// Create a promotable integer literal.
     pub(crate) fn int_literal(int: i64) -> Self {
         Self::LiteralValue(LiteralValueType::promotable(int))
+    }
+
+    /// Create the int-like literals that compare equal to an integer at runtime.
+    pub(crate) fn int_like_literal(db: &'db dyn Db, int: i64) -> Self {
+        match int {
+            0 => UnionType::from_two_elements(db, Self::int_literal(0), Self::bool_literal(false)),
+            1 => UnionType::from_two_elements(db, Self::int_literal(1), Self::bool_literal(true)),
+            _ => Self::int_literal(int),
+        }
     }
 
     /// Create a promotable single-character string literal.

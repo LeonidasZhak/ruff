@@ -1,5 +1,5 @@
 use crate::Db;
-use crate::reachability::{ReachabilityConstraintsExtension, sequence_pattern_type};
+use crate::reachability::ReachabilityConstraintsExtension;
 use crate::subscript::PyIndex;
 use crate::types::function::KnownFunction;
 use crate::types::infer::{ExpressionInference, infer_same_file_expression_type};
@@ -11,13 +11,14 @@ use crate::types::typed_dict::{
 use crate::types::{
     CallableType, ClassLiteral, ClassType, IntersectionBuilder, IntersectionType, KnownClass,
     KnownInstanceType, LiteralValueTypeKind, SpecialFormType, SubclassOfInner, SubclassOfType,
-    Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder, infer_expression_types,
+    Truthiness, Type, TypeContext, TypeVarBoundOrConstraints, UnionBuilder,
+    exact_sequence_pattern_type, infer_expression_types, sequence_pattern_type,
 };
 use ty_python_core::expression::Expression;
 use ty_python_core::place::{PlaceExpr, PlaceTable, ScopedPlaceId};
 use ty_python_core::predicate::{
     CallableAndCallExpr, ClassPatternKind, PatternPredicate, PatternPredicateKind, Predicate,
-    PredicateNode,
+    PredicateNode, SequencePatternPredicateKind,
 };
 use ty_python_core::scope::ScopeId;
 use ty_python_core::{NarrowingEvaluator, place_table, semantic_index};
@@ -922,7 +923,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 self.evaluate_match_pattern_mapping(subject, *kind, is_positive)
             }
             PatternPredicateKind::Sequence(kind) => {
-                self.evaluate_match_pattern_sequence(subject, *kind, is_positive)
+                self.evaluate_match_pattern_sequence(subject, kind, is_positive)
             }
             PatternPredicateKind::Value(expr) => {
                 self.evaluate_match_pattern_value(subject, *expr, is_positive)
@@ -1627,19 +1628,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 };
 
                 let narrow_to_length = |(length_literal, length)| {
-                    let protocol_length = match length_literal {
-                        0 => UnionType::from_two_elements(
-                            self.db,
-                            Type::int_literal(0),
-                            Type::bool_literal(false),
-                        ),
-                        1 => UnionType::from_two_elements(
-                            self.db,
-                            Type::int_literal(1),
-                            Type::bool_literal(true),
-                        ),
-                        _ => Type::int_literal(length_literal),
-                    };
+                    let protocol_length = Type::int_like_literal(self.db, length_literal);
                     let exactly_sized = KnownClass::ExactlySized
                         .to_specialized_instance(self.db, &[protocol_length]);
                     Self::narrow_type_by_exact_len(
@@ -2134,25 +2123,74 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         )]))
     }
 
+    /// Return a type that every value matching `pattern` must inhabit.
+    fn match_pattern_type(&self, pattern: &PatternPredicateKind<'db>) -> Type<'db> {
+        match pattern {
+            PatternPredicateKind::Singleton(singleton) => match singleton {
+                ast::Singleton::None => Type::none(self.db),
+                ast::Singleton::True => Type::bool_literal(true),
+                ast::Singleton::False => Type::bool_literal(false),
+            },
+            PatternPredicateKind::Class(cls, _) => {
+                match infer_same_file_expression_type(self.db, *cls, TypeContext::default()) {
+                    Type::ClassLiteral(class) => {
+                        Type::instance(self.db, class.top_materialization(self.db))
+                    }
+                    _ => Type::object(),
+                }
+            }
+            PatternPredicateKind::Mapping(_) => KnownClass::Mapping
+                .to_instance(self.db)
+                .top_materialization(self.db),
+            PatternPredicateKind::Sequence(kind) => self.sequence_pattern_type(kind),
+            PatternPredicateKind::Or(predicates) => UnionType::from_elements(
+                self.db,
+                predicates
+                    .iter()
+                    .map(|predicate| self.match_pattern_type(predicate)),
+            ),
+            PatternPredicateKind::As(pattern, _) => pattern
+                .as_deref()
+                .map(|pattern| self.match_pattern_type(pattern))
+                .unwrap_or_else(Type::object),
+            PatternPredicateKind::Value(_) | PatternPredicateKind::Unsupported => Type::object(),
+        }
+    }
+
+    /// Fixed-length patterns preserve element constraints. Starred patterns
+    /// only prove that the subject is a valid sequence-pattern value.
+    fn sequence_pattern_type(&self, kind: &SequencePatternPredicateKind<'db>) -> Type<'db> {
+        if kind.is_exact_length() {
+            let element_types: Vec<_> = kind
+                .patterns
+                .iter()
+                .map(|pattern| self.match_pattern_type(pattern))
+                .collect();
+            exact_sequence_pattern_type(self.db, &element_types)
+        } else {
+            sequence_pattern_type(self.db)
+        }
+    }
+
     fn evaluate_match_pattern_sequence(
         &mut self,
         subject: Expression<'db>,
-        kind: ClassPatternKind,
+        kind: &SequencePatternPredicateKind<'db>,
         is_positive: bool,
     ) -> Option<NarrowingConstraints<'db>> {
-        if !kind.is_irrefutable() && !is_positive {
-            return None;
-        }
+        let constraint = if is_positive {
+            NarrowingConstraint::intersection(self.sequence_pattern_type(kind))
+        } else {
+            if !kind.is_irrefutable() {
+                return None;
+            }
+            NarrowingConstraint::intersection(sequence_pattern_type(self.db).negate(self.db))
+        };
 
         let subject = PlaceExpr::try_from_expr(subject.node_ref(self.db).node(self.module))?;
         let place = self.expect_place(&subject);
 
-        let sequence_type = sequence_pattern_type(self.db).negate_if(self.db, !is_positive);
-
-        Some(NarrowingConstraints::from_iter([(
-            place,
-            NarrowingConstraint::intersection(sequence_type),
-        )]))
+        Some(NarrowingConstraints::from_iter([(place, constraint)]))
     }
 
     fn evaluate_match_pattern_value(

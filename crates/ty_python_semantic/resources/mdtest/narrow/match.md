@@ -175,6 +175,50 @@ def test_match_star_excludes_text_and_bytes(x: str | bytes | bytearray | list[in
             reveal_type(x)  # revealed: list[int]
         case _:
             reveal_type(x)  # revealed: str | bytes | bytearray
+
+def test_match_exact_object_sequence(value: object) -> None:
+    match value:
+        case int(), str():
+            # revealed: Sequence[object] & <Protocol with members '__getitem__', '__len__'> & ~str & ~bytes & ~bytearray
+            reveal_type(value)
+            reveal_type(len(value))  # revealed: Literal[2]
+            reveal_type(value[0])  # revealed: int
+            reveal_type(value[1])  # revealed: str
+
+def test_match_empty_object_sequence(value: object) -> None:
+    match value:
+        case []:
+            # revealed: Sequence[object] & <Protocol with members '__len__'> & ~str & ~bytes & ~bytearray
+            reveal_type(value)
+            reveal_type(len(value))  # revealed: Literal[0]
+
+def test_match_singleton_object_sequence(value: object) -> None:
+    match value:
+        case [int()]:
+            # revealed: Sequence[object] & <Protocol with members '__getitem__', '__len__'> & ~bytearray & ~bytes
+            reveal_type(value)
+            reveal_type(len(value))  # revealed: Literal[1]
+            reveal_type(value[0])  # revealed: int
+
+def test_match_prefix_star_object_sequence(value: object) -> None:
+    match value:
+        case [int(), *rest]:
+            reveal_type(value)  # revealed: Sequence[object] & ~str & ~bytes & ~bytearray
+            reveal_type(len(value))  # revealed: int
+
+# Exact patterns are commonly used to validate parsed data before using it.
+
+def unwrap_single_int(value: object) -> int | None:
+    match value:
+        case [int()]:
+            return value[0]
+    return None
+
+def normalize_counted_label(value: object | None) -> str | None:
+    match value:
+        case [int(), str()]:
+            return value[1].upper() * value[0]
+    return None
 ```
 
 ## Value patterns
