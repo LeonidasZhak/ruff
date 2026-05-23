@@ -1255,31 +1255,28 @@ impl<'db> IntersectionBuilder<'db> {
                 .then_some(Type::Union(*union))
         });
 
-        if let Some(deferred_union) = deferred_union {
-            // A single-valued conjunct cannot partially reduce a union: it either survives or
-            // makes the entire conjunction impossible. Check that before materializing one
-            // `Never` intersection per union element, e.g. for `(A | B | C) & None`.
-            if conjuncts.iter().copied().any(|conjunct| {
-                conjunct != deferred_union
-                    && conjunct.is_single_valued(self.db)
-                    && deferred_union.is_disjoint_from(self.db, conjunct)
-            }) {
-                return self.add_positive(Type::Never);
-            }
+        let Some(deferred_union) = deferred_union else {
+            return self.positive_elements(conjuncts);
+        };
 
-            for &conjunct in conjuncts
+        // A single-valued conjunct cannot partially reduce a union: it either survives or
+        // makes the entire conjunction impossible. Check that before materializing one
+        // `Never` intersection per union element, e.g. for `(A | B | C) & None`.
+        if conjuncts.iter().copied().any(|conjunct| {
+            conjunct != deferred_union
+                && conjunct.is_single_valued(self.db)
+                && deferred_union.is_disjoint_from(self.db, conjunct)
+        }) {
+            return self.add_positive(Type::Never);
+        }
+
+        self.positive_elements(
+            conjuncts
                 .iter()
                 .filter(|conjunct| !conjunct.is_union())
                 .chain(conjuncts.iter().filter(|conjunct| conjunct.is_union()))
-            {
-                self = self.add_positive(conjunct);
-            }
-        } else {
-            for conjunct in conjuncts {
-                self = self.add_positive(conjunct);
-            }
-        }
-        self
+                .copied(),
+        )
     }
 
     pub(crate) fn build(self) -> Type<'db> {
