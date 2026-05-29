@@ -186,6 +186,9 @@ fn render_markdown(docstring: &str) -> String {
     // break out of it, even if they're writing python documentation about markdown
     // code fences and are showing off how you can use more than 3 backticks.
     const FENCE: &str = "```````````";
+
+    let docstring = rest::ParsedFieldLists::parse(docstring).render_markdown();
+
     // TODO: there is a convention that `singletick` is for items that can
     // be looked up in-scope while ``multitick`` is for opaque inline code.
     // While rendering this we should make note of all the `singletick` locations
@@ -900,6 +903,33 @@ mod tests {
         ```````````
         You love to see it.
         "#);
+    }
+
+    #[test]
+    fn rest_field_list_renders_markdown_sections() {
+        let _snap = bind_docstring_snapshot_filters();
+        let docstring = Docstring::new(
+            "\
+:param foo: The object.
+:type foo: tuple[:class:`Bar`,
+    str]
+:returns result: The new object.
+:rtype: dict[str,
+    int]
+:raises ValueError: If the value is invalid."
+                .to_owned(),
+        );
+
+        assert_snapshot!(docstring.render_markdown(), @"
+        ## Parameters<HB>
+        `foo` (``tuple[:class:`Bar`, str]``): The object.<HB>
+        <HB>
+        ## Returns<HB>
+        `result` (`dict[str, int]`): The new object.<HB>
+        <HB>
+        ## Raises<HB>
+        `ValueError`: If the value is invalid.
+        ");
     }
 
     // A literal block where the `::`  with the paragraph
@@ -1922,60 +1952,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rest_style_parameter_documentation() {
-        let _snap = bind_docstring_snapshot_filters();
-        let docstring = r#"
-        This is a function description.
-
-        :param str param1: The first parameter description
-        :param int param2: The second parameter description
-            This is a continuation of param2 description.
-        :param param3: A parameter without type annotation
-        :returns: The return value description
-        :rtype: str
-        "#;
-
-        let docstring = Docstring::new(docstring.to_owned());
-        let param_docs = docstring.parameter_documentation();
-
-        assert_eq!(param_docs.len(), 3);
-        assert_eq!(
-            param_docs.get("param1").expect("param1 should exist"),
-            "The first parameter description"
-        );
-        assert_eq!(
-            param_docs.get("param2").expect("param2 should exist"),
-            "The second parameter description\nThis is a continuation of param2 description."
-        );
-        assert_eq!(
-            param_docs.get("param3").expect("param3 should exist"),
-            "A parameter without type annotation"
-        );
-
-        assert_snapshot!(docstring.render_plaintext(), @"
-        This is a function description.
-
-        :param str param1: The first parameter description
-        :param int param2: The second parameter description
-            This is a continuation of param2 description.
-        :param param3: A parameter without type annotation
-        :returns: The return value description
-        :rtype: str
-        ");
-
-        assert_snapshot!(docstring.render_markdown(), @"
-        This is a function description.<HB>
-        <HB>
-        :param str param1: The first parameter description<HB>
-        :param int param2: The second parameter description<HB>
-        &nbsp;&nbsp;&nbsp;&nbsp;This is a continuation of param2 description.<HB>
-        :param param3: A parameter without type annotation<HB>
-        :returns: The return value description<HB>
-        :rtype: str
-        ");
-    }
-
-    #[test]
     fn test_mixed_style_with_rest_parameter_documentation() {
         let _snap = bind_docstring_snapshot_filters();
         let docstring = r#"
@@ -2035,8 +2011,9 @@ mod tests {
         Args:<HB>
         &nbsp;&nbsp;&nbsp;&nbsp;param1 (str): Google-style parameter<HB>
         <HB>
-        :param int param2: reST-style parameter<HB>
-        :param param3: Another reST-style parameter<HB>
+        ## Parameters<HB>
+        `param2` (`int`): reST-style parameter<HB>
+        `param3`: Another reST-style parameter<HB>
         <HB>
         Parameters<HB>
         ----------<HB>

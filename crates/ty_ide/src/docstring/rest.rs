@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+
 use ruff_python_trivia::leading_indentation;
 use ruff_source_file::UniversalNewlines;
 
@@ -26,16 +29,6 @@ impl<'a> ParsedFieldLists<'a> {
     }
 
     pub(super) fn parameter_documentation(&self) -> Vec<ParameterDocumentation> {
-        debug_assert!(self.docstring.is_empty() || !self.lines.is_empty());
-        debug_assert!(self.field_lists.iter().all(|field_list| {
-            field_list.start_line < field_list.end_line
-                && field_list.end_line <= self.lines.len()
-                && self
-                    .lines
-                    .get(field_list.start_line)
-                    .is_some_and(|line| FieldStart::indentation(line) == field_list.indent)
-        }));
-
         self.field_lists
             .iter()
             .flat_map(|field_list| &field_list.fields)
@@ -48,19 +41,45 @@ impl<'a> ParsedFieldLists<'a> {
                     name: lookup_name.clone(),
                     description: description.clone(),
                 }),
-                Field::Unknown {
-                    name,
-                    argument,
-                    body,
-                } => {
-                    debug_assert!(!name.is_empty());
-                    debug_assert!(!argument.contains('\n'));
-                    debug_assert!(!body.starts_with('\n'));
-                    None
-                }
                 _ => None,
             })
             .collect()
+    }
+
+    /// Returns the original docstring when no supported field list is rendered.
+    pub(super) fn render_markdown(&self) -> Cow<'a, str> {
+        let mut rendered: Option<Vec<String>> = None;
+        let mut index = 0;
+
+        for field_list in &self.field_lists {
+            if field_list.indent != 0 || field_list.start_line < index {
+                continue;
+            }
+
+            let Some(markdown) = field_list.render_markdown() else {
+                continue;
+            };
+
+            let rendered = rendered.get_or_insert_with(|| {
+                let mut rendered = Vec::with_capacity(self.lines.len());
+                rendered.extend(self.lines[..index].iter().map(|line| (*line).to_string()));
+                rendered
+            });
+            rendered.extend(
+                self.lines[index..field_list.start_line]
+                    .iter()
+                    .map(|line| (*line).to_string()),
+            );
+            rendered.push(markdown);
+            index = field_list.end_line;
+        }
+
+        rendered
+            .map(|mut rendered| {
+                rendered.extend(self.lines[index..].iter().map(|line| (*line).to_string()));
+                Cow::Owned(rendered.join("\n"))
+            })
+            .unwrap_or(Cow::Borrowed(self.docstring))
     }
 }
 
@@ -171,6 +190,211 @@ impl FieldList {
             FieldStart::at_indent(line, indent).is_some() || FieldStart::indentation(line) > indent
         })
     }
+
+    fn render_markdown(&self) -> Option<String> {
+        let mut has_rendered_field = false;
+        let mut has_returns = false;
+        let mut has_return_type = false;
+        let mut parameter_types = HashMap::new();
+        let mut return_type = None;
+
+        for field in &self.fields {
+            match field {
+                Field::Parameter { .. } | Field::Raises { .. } => {
+                    has_rendered_field = true;
+                }
+                Field::Returns { .. } => {
+                    has_rendered_field = true;
+                    has_returns = true;
+                }
+                Field::ParameterType { lookup_name, ty } => {
+                    if !self.fields.iter().any(|field| {
+                        matches!(field, Field::Parameter { lookup_name: parameter, .. } if parameter == lookup_name)
+                    }) {
+                        return None;
+                    }
+
+                    if parameter_types
+                        .insert(lookup_name.as_str(), ty.as_str())
+                        .is_some()
+                    {
+                        return None;
+                    }
+                }
+                Field::ReturnType { ty } => {
+                    if has_return_type {
+                        return None;
+                    }
+                    has_return_type = true;
+                    return_type = (!ty.is_empty()).then_some(ty.as_str());
+                }
+                Field::Unknown { .. } => return None,
+            }
+        }
+
+        if !has_rendered_field || (has_return_type && !has_returns) {
+            return None;
+        }
+
+        let mut output = String::new();
+        let mut current_heading = None;
+        let mut previous_description = None;
+
+        for field in &self.fields {
+            let (heading, name, ty, description) = match field {
+                Field::Parameter {
+                    display_name,
+                    lookup_name,
+                    ty,
+                    description,
+                } => (
+                    "Parameters",
+                    Some(display_name.as_str()),
+                    ty.as_deref().or_else(|| {
+                        parameter_types
+                            .get(lookup_name.as_str())
+                            .copied()
+                            .filter(|ty| !ty.is_empty())
+                    }),
+                    description.as_str(),
+                ),
+                Field::Returns { name, description } => (
+                    "Returns",
+                    name.as_deref(),
+                    return_type,
+                    description.as_str(),
+                ),
+                Field::Raises {
+                    exception,
+                    description,
+                } => ("Raises", exception.as_deref(), None, description.as_str()),
+                Field::ParameterType { .. } | Field::ReturnType { .. } | Field::Unknown { .. } => {
+                    continue;
+                }
+            };
+
+            if current_heading != Some(heading) {
+                if !output.is_empty() {
+                    output.push_str("\n\n");
+                }
+                output.push_str("## ");
+                output.push_str(heading);
+                output.push('\n');
+                current_heading = Some(heading);
+            } else {
+                output.push('\n');
+                if previous_description
+                    .is_some_and(ParsedFieldLists::description_leaves_doctest_open)
+                {
+                    output.push('\n');
+                }
+            }
+
+            output.push_str(&ParsedFieldLists::render_field_entry(name, ty, description));
+            previous_description = Some(description);
+        }
+
+        Some(output)
+    }
+}
+
+impl ParsedFieldLists<'_> {
+    fn render_field_entry(name: Option<&str>, ty: Option<&str>, description: &str) -> String {
+        let mut entry = String::new();
+        if let Some(name) = name {
+            entry.push_str(&Self::markdown_code_span(name));
+        }
+
+        if let Some(ty) = ty
+            && !ty.is_empty()
+        {
+            if !entry.is_empty() {
+                entry.push(' ');
+            }
+            entry.push('(');
+            entry.push_str(&Self::markdown_type_code_span(ty));
+            entry.push(')');
+        }
+
+        if !description.is_empty() {
+            let starts_with_block = Self::description_starts_with_markdown_block(description);
+            if !entry.is_empty() {
+                entry.push_str(if starts_with_block { ":\n" } else { ": " });
+            }
+            if starts_with_block {
+                entry.push_str(description);
+            } else {
+                entry.push_str(&description.replace('\n', "\n    "));
+            }
+        }
+
+        entry
+    }
+
+    fn description_leaves_doctest_open(description: &str) -> bool {
+        let mut markdown_fence: Option<String> = None;
+        let mut in_doctest = false;
+
+        for line in description.lines().map(|line| line.trim_start_matches(' ')) {
+            if let Some(fence) = &markdown_fence {
+                if markdown::closes_fence(line, fence) {
+                    markdown_fence = None;
+                }
+            } else if in_doctest {
+                if line.is_empty() {
+                    in_doctest = false;
+                }
+            } else if line.starts_with(">>>") {
+                in_doctest = true;
+            } else if let Some(fence) = markdown::fence_start(line) {
+                markdown_fence = Some(fence.to_string());
+            }
+        }
+
+        in_doctest
+    }
+
+    fn description_starts_with_markdown_block(description: &str) -> bool {
+        description.lines().next().is_some_and(|first_line| {
+            let first_line = first_line.trim_start_matches(' ');
+            markdown::fence_start(first_line).is_some() || first_line.starts_with(">>>")
+        })
+    }
+
+    fn markdown_type_code_span(ty: &str) -> String {
+        let normalized = Self::normalized_type(ty);
+        Self::markdown_code_span(&normalized)
+    }
+
+    fn normalized_type(ty: &str) -> Cow<'_, str> {
+        if !ty.contains('\n') {
+            return Cow::Borrowed(ty);
+        }
+
+        let mut normalized = String::new();
+        for line in ty.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push_str(line);
+        }
+
+        Cow::Owned(normalized)
+    }
+
+    fn markdown_code_span(text: &str) -> String {
+        let longest_backtick_run = text
+            .split(|char| char != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let delimiter = "`".repeat(longest_backtick_run + 1);
+        if text.starts_with('`') || text.ends_with('`') {
+            format!("{delimiter} {text} {delimiter}")
+        } else {
+            format!("{delimiter}{text}{delimiter}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +403,21 @@ enum Field {
         display_name: String,
         lookup_name: String,
         ty: Option<String>,
+        description: String,
+    },
+    ParameterType {
+        lookup_name: String,
+        ty: String,
+    },
+    Returns {
+        name: Option<String>,
+        description: String,
+    },
+    ReturnType {
+        ty: String,
+    },
+    Raises {
+        exception: Option<String>,
         description: String,
     },
     Unknown {
@@ -246,6 +485,16 @@ enum FieldKind<'a> {
         lookup_name: &'a str,
         ty: Option<&'a str>,
     },
+    ParameterType {
+        lookup_name: &'a str,
+    },
+    Returns {
+        name: Option<&'a str>,
+    },
+    ReturnType,
+    Raises {
+        exception: Option<&'a str>,
+    },
     Unknown {
         name: &'a str,
         argument: &'a str,
@@ -263,6 +512,21 @@ impl<'a> FieldKind<'a> {
                     ty,
                 })
                 .unwrap_or(Self::Unknown { name, argument }),
+            "type" | "paramtype" => Self::parse_parameter_name(argument)
+                .map(|name| Self::ParameterType {
+                    lookup_name: name.lookup,
+                })
+                .unwrap_or(Self::Unknown { name, argument }),
+            "return" | "returns" => Self::Returns {
+                name: Self::parse_parameter_name(argument).map(|name| name.lookup),
+            },
+            "rtype" => Self::ReturnType,
+            "raises" | "raise" | "except" | "exception" => {
+                let exception = argument.trim();
+                Self::Raises {
+                    exception: (!exception.is_empty()).then_some(exception),
+                }
+            }
             _ => Self::Unknown { name, argument },
         }
     }
@@ -330,6 +594,19 @@ impl<'a> FieldBuilder<'a> {
                 display_name: display_name.to_string(),
                 lookup_name: lookup_name.to_string(),
                 ty: ty.map(str::to_string),
+                description: body,
+            },
+            FieldKind::ParameterType { lookup_name } => Field::ParameterType {
+                lookup_name: lookup_name.to_string(),
+                ty: body,
+            },
+            FieldKind::Returns { name } => Field::Returns {
+                name: name.map(str::to_string),
+                description: body,
+            },
+            FieldKind::ReturnType => Field::ReturnType { ty: body },
+            FieldKind::Raises { exception } => Field::Raises {
+                exception: exception.map(str::to_string),
                 description: body,
             },
             FieldKind::Unknown { name, argument } => Field::Unknown {
@@ -495,6 +772,8 @@ fn starts_literal_block(line: &str) -> bool {
 mod tests {
     use std::collections::HashMap;
 
+    use insta::assert_snapshot;
+
     use super::{Field, ParsedFieldLists};
 
     #[test]
@@ -604,6 +883,219 @@ mod tests {
                     body: "Unknown description.".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn field_lists_render_supported_sections() {
+        let docstring = "\
+This is a function description.
+:class:`Foo` instances can be passed here.
+
+:param str param1: The first parameter description
+:param param2: The second parameter description
+:type param2: int
+:kwparam retries: Retry attempts.
+:paramtype retries: int
+:param *args: Extra positional arguments.
+:type args: tuple[str, ...]
+:param **kwargs: Extra keyword arguments.
+:type **kwargs: dict[str, object]
+:returns baz: The return value description
+:rtype: dict[str,
+    int]
+:raises ValueError: If the value is invalid.
+:exception RuntimeError: If the system is unavailable.";
+
+        assert_snapshot!(ParsedFieldLists::parse(docstring).render_markdown(), @"
+        This is a function description.
+        :class:`Foo` instances can be passed here.
+
+        ## Parameters
+        `param1` (`str`): The first parameter description
+        `param2` (`int`): The second parameter description
+        `retries` (`int`): Retry attempts.
+        `*args` (`tuple[str, ...]`): Extra positional arguments.
+        `**kwargs` (`dict[str, object]`): Extra keyword arguments.
+
+        ## Returns
+        `baz` (`dict[str, int]`): The return value description
+
+        ## Raises
+        `ValueError`: If the value is invalid.
+        `RuntimeError`: If the system is unavailable.
+        ");
+    }
+
+    #[test]
+    fn field_lists_preserve_unrenderable_lists() {
+        let docstring = "\
+:param first: First parameter
+:meta private:
+:param second: Second parameter
+:type orphan: str
+:param **: Missing a parameter name.";
+
+        assert_eq!(
+            ParsedFieldLists::parse(docstring).render_markdown(),
+            docstring
+        );
+
+        let param_docs = parameter_documentation(docstring);
+        assert_eq!(param_docs.len(), 2);
+        assert_eq!(
+            param_docs.get("first").expect("first should exist"),
+            "First parameter"
+        );
+        assert_eq!(
+            param_docs.get("second").expect("second should exist"),
+            "Second parameter"
+        );
+
+        for docstring in [
+            "\
+:param value: The value to validate.
+:rtype: str",
+            "\
+:param value: The value to validate.
+:type value: str
+:type value: int",
+        ] {
+            assert_eq!(
+                ParsedFieldLists::parse(docstring).render_markdown(),
+                docstring
+            );
+        }
+    }
+
+    #[test]
+    fn field_lists_render_out_of_order_sections_in_source_order() {
+        let docstring = "\
+:raises ValueError: If validation fails.
+:param value: The value to validate.
+:returns: The normalized value.
+:raises TypeError: If validation has the wrong type.";
+
+        assert_snapshot!(ParsedFieldLists::parse(docstring).render_markdown(), @"
+        ## Raises
+        `ValueError`: If validation fails.
+
+        ## Parameters
+        `value`: The value to validate.
+
+        ## Returns
+        The normalized value.
+
+        ## Raises
+        `TypeError`: If validation has the wrong type.
+        ");
+    }
+
+    #[test]
+    fn field_lists_render_well_formed_lists_after_unrenderable_lists() {
+        let docstring = "\
+:param first: First parameter.
+
+Some prose between field lists.
+
+:meta private:
+
+More prose between field lists.
+
+:param second: Second parameter.";
+
+        assert_snapshot!(ParsedFieldLists::parse(docstring).render_markdown(), @"
+        ## Parameters
+        `first`: First parameter.
+
+        Some prose between field lists.
+
+        :meta private:
+
+        More prose between field lists.
+
+        ## Parameters
+        `second`: Second parameter.
+        ");
+    }
+
+    #[test]
+    fn field_lists_render_block_descriptions_on_new_lines() {
+        let docstring = "\
+:param example:
+    ```python
+    if ok:
+        do_work()
+    ```
+:param prompt:
+    >>> print('prompt')
+:param other: Another parameter";
+
+        assert_snapshot!(ParsedFieldLists::parse(docstring).render_markdown(), @r#"
+        ## Parameters
+        `example`:
+        ```python
+        if ok:
+            do_work()
+        ```
+        `prompt`:
+        >>> print('prompt')
+
+        `other`: Another parameter
+        "#);
+
+        let param_docs = parameter_documentation(docstring);
+        assert_eq!(
+            param_docs.get("example").expect("example should exist"),
+            "```python\nif ok:\n    do_work()\n```"
+        );
+    }
+
+    #[test]
+    fn field_lists_inside_code_examples_are_preserved() {
+        let docstring = "\
+Markdown input:
+
+```text
+:param sample: This is sample input
+```
+
+Doctest output:
+
+>>> print(\"field list\")
+:param sample: This is sample output
+
+Literal block::
+
+    :param sample: This is sample input
+
+:param real: Real parameter";
+
+        assert_snapshot!(ParsedFieldLists::parse(docstring).render_markdown(), @"
+        Markdown input:
+
+        ```text
+        :param sample: This is sample input
+        ```
+
+        Doctest output:
+
+        >>> print(\"field list\")
+        :param sample: This is sample output
+
+        Literal block::
+
+            :param sample: This is sample input
+
+        ## Parameters
+        `real`: Real parameter
+        ");
+
+        let param_docs = parameter_documentation(docstring);
+        assert_eq!(param_docs.len(), 1);
+        assert_eq!(
+            param_docs.get("real").expect("real should exist"),
+            "Real parameter"
         );
     }
 
