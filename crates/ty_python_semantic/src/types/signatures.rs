@@ -20,11 +20,12 @@ use smallvec::{SmallVec, smallvec_inline};
 use super::{DynamicType, Type, TypeVarVariance, UnionType, semantic_index};
 use crate::types::callable::{CallableFunctionProvenance, CallableTypeKind};
 use crate::types::constraints::{
-    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension,
+    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBounds,
 };
 use crate::types::cyclic::ActiveRecursionDetector;
 use crate::types::generics::{
-    ApplySpecialization, GenericContext, InferableTypeVars, Specialization, walk_generic_context,
+    ApplySpecialization, GenericContext, InferableTypeVars, Specialization, SpecializationBuilder,
+    walk_generic_context,
 };
 use crate::types::infer::{TypeExpressionFlags, infer_deferred_types};
 use crate::types::relation::{
@@ -950,30 +951,39 @@ impl<'db> Signature<'db> {
         }
     }
 
-    /// Returns `true` if this signature's first parameter can accept the bound `self` type.
+    /// Returns the conditions under which this signature's first parameter can accept the bound
+    /// `self` type.
     ///
     /// This is used to prune impossible overloads when a method is bound to a concrete receiver.
     /// If a signature has no positional first parameter, we conservatively keep it.
-    pub(crate) fn can_bind_self_to(&self, db: &'db dyn Db, self_type: Type<'db>) -> bool {
+    ///
+    /// For example, binding `Base().method` removes an overload whose first parameter is explicitly
+    /// annotated as `self: Child`, while binding `Child().method` keeps it.
+    fn when_can_bind_self_to<'c>(
+        &self,
+        db: &'db dyn Db,
+        self_type: Type<'db>,
+        constraints: &'c ConstraintSetBuilder<'db>,
+    ) -> ConstraintSet<'db, 'c> {
         // A dynamic receiver might be compatible with any explicit receiver annotation.
         if self_type.is_dynamic() {
-            return true;
+            return ConstraintSet::from_bool(constraints, true);
         }
 
         // Without a first parameter, there is no receiver annotation to check.
         let Some(first_parameter) = self.parameters.get(0) else {
-            return true;
+            return ConstraintSet::from_bool(constraints, true);
         };
 
         // If there is no positional receiver, this signature cannot be pruned based on `self`.
         if !first_parameter.is_positional() {
-            return true;
+            return ConstraintSet::from_bool(constraints, true);
         }
 
         // Inferred receiver annotations describe the method owner, rather than constraining which
         // overload is exposed for a bound receiver. Only explicit receiver annotations can prune.
         if first_parameter.inferred_annotation {
-            return true;
+            return ConstraintSet::from_bool(constraints, true);
         }
 
         let mut expected_self_ty = first_parameter.annotated_type();
@@ -983,7 +993,7 @@ impl<'db> Signature<'db> {
         // Avoid the more expensive normalization below for receiver annotations that already
         // accept all values, or already exactly match the bound receiver.
         if accepts_any_or_exact_self(expected_self_ty) {
-            return true;
+            return ConstraintSet::from_bool(constraints, true);
         }
 
         // TODO: Expand type aliases here so `type Alias = Self` in a class body
@@ -992,7 +1002,7 @@ impl<'db> Signature<'db> {
 
         // `Self` binding can make the receiver annotation trivially compatible.
         if accepts_any_or_exact_self(expected_self_ty) {
-            return true;
+            return ConstraintSet::from_bool(constraints, true);
         }
 
         // A specialized receiver can make generic receiver annotations concrete enough to compare.
@@ -1002,19 +1012,85 @@ impl<'db> Signature<'db> {
 
             // Specialization can also make the receiver annotation trivially compatible.
             if accepts_any_or_exact_self(expected_self_ty) {
-                return true;
+                return ConstraintSet::from_bool(constraints, true);
             }
         }
 
+        self_type.when_constraint_set_assignable_to(db, expected_self_ty, constraints)
+    }
+
+    /// Returns this signature bound to `self_type` if its explicit receiver annotation is
+    /// compatible with the bound receiver.
+    ///
+    /// Matching the receiver can also constrain type variables that occur elsewhere in the
+    /// signature. For example, binding this overload to `Box[str]().method` should produce
+    /// `(value: str) -> str`, rather than `(value: S) -> S`:
+    ///
+    /// ```py
+    /// class Box[T]:
+    ///     @overload
+    ///     def method[S](self: "Box[S]", value: S) -> S: ...
+    /// ```
+    ///
+    /// A protocol receiver can impose a one-sided constraint instead of determining one exact
+    /// specialization. In that case, keep the type variable generic instead of choosing an
+    /// arbitrary compatible type.
+    pub(crate) fn bind_self_if_compatible(
+        &self,
+        db: &'db dyn Db,
+        self_type: Type<'db>,
+        typing_self_type: Type<'db>,
+    ) -> Option<Self> {
         let constraints = ConstraintSetBuilder::new();
-        self_type
-            .when_assignable_to(
-                db,
-                expected_self_ty,
-                &constraints,
-                self.inferable_typevars(db),
-            )
+        let when = self.when_can_bind_self_to(db, self_type, &constraints);
+        let inferable = self.inferable_typevars(db);
+        // Prune the overload only if its own type variables cannot make the receiver compatible.
+        if !when
+            .reduce_inferable(db, &constraints, inferable.iter(db))
             .is_always_satisfied(db)
+        {
+            return None;
+        }
+
+        let signature = if when.is_always_satisfied(db) {
+            self.clone()
+        } else if let Some(generic_context) = self.generic_context {
+            let mut builder = SpecializationBuilder::new(db, &constraints, inferable);
+            builder.add_constraint_set(when);
+            let concrete_class_receiver =
+                matches!(self_type, Type::ClassLiteral(_) | Type::GenericAlias(_));
+            let bound_signature = self.bind_self(db, Some(typing_self_type));
+            let specialization = builder.build_with(generic_context, |typevar, bounds| {
+                // Exact bounds determine an unambiguous specialization, as in the `Box[str]`
+                // example above.
+                if let Some((lower, upper)) = bounds
+                    && lower.is_equivalent_to(db, upper)
+                {
+                    return Some(lower);
+                }
+
+                // A concrete class receiver should determine typevars that only flow out of the
+                // bound callable, as in `EnumMeta.__call__`. Keep underdetermined input typevars
+                // generic.
+                if let Some((lower, upper)) = bounds
+                    && concrete_class_receiver
+                    && bound_signature.variance_of(db, typevar).is_covariant()
+                    && !lower.is_never()
+                    && let Ok(Some(solution)) =
+                        PathBounds::default_solve(db, &constraints, typevar, lower, upper)
+                {
+                    return Some(solution);
+                }
+
+                // Preserve a generic signature when the receiver only narrows the possible values.
+                Some(Type::TypeVar(typevar))
+            });
+            self.apply_specialization(db, specialization)
+        } else {
+            self.clone()
+        };
+
+        Some(signature.bind_self(db, Some(typing_self_type)))
     }
 
     pub(crate) fn has_explicit_positional_receiver_annotation(&self) -> bool {
