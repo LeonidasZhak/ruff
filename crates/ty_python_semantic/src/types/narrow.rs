@@ -2124,7 +2124,11 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     }
 
     /// Return a type that every value matching `pattern` must inhabit.
-    fn match_pattern_type(&self, pattern: &PatternPredicateKind<'db>) -> Type<'db> {
+    ///
+    /// Positive narrowing uses this as a sound over-approximation: the result
+    /// may include values that fail nested refutable checks, but matching
+    /// values cannot fall outside it.
+    fn necessary_match_pattern_type(&self, pattern: &PatternPredicateKind<'db>) -> Type<'db> {
         match pattern {
             PatternPredicateKind::Singleton(singleton) => match singleton {
                 ast::Singleton::None => Type::none(self.db),
@@ -2142,33 +2146,121 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             PatternPredicateKind::Mapping(_) => KnownClass::Mapping
                 .to_instance(self.db)
                 .top_materialization(self.db),
-            PatternPredicateKind::Sequence(kind) => self.sequence_pattern_type(kind),
+            PatternPredicateKind::Sequence(kind) => self.necessary_sequence_pattern_type(kind),
             PatternPredicateKind::Or(predicates) => UnionType::from_elements(
                 self.db,
                 predicates
                     .iter()
-                    .map(|predicate| self.match_pattern_type(predicate)),
+                    .map(|predicate| self.necessary_match_pattern_type(predicate)),
             ),
             PatternPredicateKind::As(pattern, _) => pattern
                 .as_deref()
-                .map(|pattern| self.match_pattern_type(pattern))
+                .map(|pattern| self.necessary_match_pattern_type(pattern))
                 .unwrap_or_else(Type::object),
             PatternPredicateKind::Value(_) | PatternPredicateKind::Unsupported => Type::object(),
         }
     }
 
+    /// Return the values that are guaranteed to match `pattern`.
+    ///
+    /// Negative narrowing can subtract only this under-approximation. Refutable
+    /// or value-dependent checks that are not statically exact return `Never`
+    /// rather than excluding values that might fail the pattern at runtime.
+    fn definite_match_pattern_type(&self, pattern: &PatternPredicateKind<'db>) -> Type<'db> {
+        match pattern {
+            PatternPredicateKind::Singleton(singleton) => match singleton {
+                ast::Singleton::None => Type::none(self.db),
+                ast::Singleton::True => Type::bool_literal(true),
+                ast::Singleton::False => Type::bool_literal(false),
+            },
+            PatternPredicateKind::Value(value) => {
+                let ty = infer_same_file_expression_type(self.db, *value, TypeContext::default());
+                if ty.is_single_valued(self.db) {
+                    ty
+                } else {
+                    Type::Never
+                }
+            }
+            PatternPredicateKind::Class(cls, kind) => {
+                if !kind.is_irrefutable() {
+                    return Type::Never;
+                }
+
+                match infer_same_file_expression_type(self.db, *cls, TypeContext::default()) {
+                    Type::ClassLiteral(class) => {
+                        Type::instance(self.db, class.top_materialization(self.db))
+                    }
+                    _ => Type::Never,
+                }
+            }
+            PatternPredicateKind::Mapping(kind) => {
+                if kind.is_irrefutable() {
+                    KnownClass::Mapping
+                        .to_instance(self.db)
+                        .top_materialization(self.db)
+                } else {
+                    Type::Never
+                }
+            }
+            PatternPredicateKind::Sequence(kind) => self.definite_sequence_pattern_type(kind),
+            PatternPredicateKind::Or(predicates) => UnionType::from_elements(
+                self.db,
+                predicates
+                    .iter()
+                    .map(|predicate| self.definite_match_pattern_type(predicate)),
+            ),
+            PatternPredicateKind::As(pattern, _) => pattern
+                .as_deref()
+                .map(|pattern| self.definite_match_pattern_type(pattern))
+                .unwrap_or_else(Type::object),
+            PatternPredicateKind::Unsupported => Type::Never,
+        }
+    }
+
     /// Fixed-length patterns preserve element constraints. Starred patterns
     /// only prove that the subject is a valid sequence-pattern value.
-    fn sequence_pattern_type(&self, kind: &SequencePatternPredicateKind<'db>) -> Type<'db> {
+    fn necessary_sequence_pattern_type(
+        &self,
+        kind: &SequencePatternPredicateKind<'db>,
+    ) -> Type<'db> {
         if kind.is_exact_length() {
             let element_types: Vec<_> = kind
                 .patterns
                 .iter()
-                .map(|pattern| self.match_pattern_type(pattern))
+                .map(|pattern| self.necessary_match_pattern_type(pattern))
                 .collect();
             exact_sequence_pattern_type(self.db, &element_types)
         } else {
             sequence_pattern_type(self.db)
+        }
+    }
+
+    /// Return a definite type for a sequence pattern.
+    ///
+    /// Only irrefutable sequence patterns and exact-length patterns with
+    /// definite element types can be safely subtracted from later branches.
+    fn definite_sequence_pattern_type(
+        &self,
+        kind: &SequencePatternPredicateKind<'db>,
+    ) -> Type<'db> {
+        if kind.is_irrefutable() {
+            return sequence_pattern_type(self.db);
+        }
+
+        if kind.is_exact_length() {
+            let element_types: Vec<_> = kind
+                .patterns
+                .iter()
+                .map(|pattern| self.definite_match_pattern_type(pattern))
+                .collect();
+
+            if element_types.iter().any(Type::is_never) {
+                Type::Never
+            } else {
+                exact_sequence_pattern_type(self.db, &element_types)
+            }
+        } else {
+            Type::Never
         }
     }
 
@@ -2179,12 +2271,13 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         is_positive: bool,
     ) -> Option<NarrowingConstraints<'db>> {
         let constraint = if is_positive {
-            NarrowingConstraint::intersection(self.sequence_pattern_type(kind))
+            NarrowingConstraint::intersection(self.necessary_sequence_pattern_type(kind))
         } else {
-            if !kind.is_irrefutable() {
+            let sequence_type = self.definite_sequence_pattern_type(kind);
+            if sequence_type.is_never() {
                 return None;
             }
-            NarrowingConstraint::intersection(sequence_pattern_type(self.db).negate(self.db))
+            NarrowingConstraint::intersection(sequence_type.negate(self.db))
         };
 
         let subject = PlaceExpr::try_from_expr(subject.node_ref(self.db).node(self.module))?;

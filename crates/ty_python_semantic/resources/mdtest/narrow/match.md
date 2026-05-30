@@ -155,6 +155,8 @@ def test_match_refutable(x: dict | int) -> None:
 
 ```py
 from collections.abc import Sequence
+from typing import NamedTuple
+from typing_extensions import assert_never
 
 def test_match_star(x: Sequence[int] | int) -> None:
     match x:
@@ -219,6 +221,52 @@ def normalize_counted_label(value: object | None) -> str | None:
         case [int(), str()]:
             return value[1].upper() * value[0]
     return None
+
+def test_match_exact_tuple_sequence(subj: tuple[int | str, int | str]) -> None:
+    match subj:
+        case x, str():
+            reveal_type(subj)  # revealed: tuple[int | str, str]
+        case y:
+            reveal_type(subj)  # revealed: tuple[int | str, int]
+
+def test_match_exact_tuple_sequence_is_exhaustive(value: int | tuple[int, int]) -> int:
+    match value:
+        case int(value):
+            return value
+        case (left, right):
+            return left + right
+        case _:
+            assert_never(value)
+
+class Pair(NamedTuple):
+    left: int | str
+    right: int | str
+
+def test_match_exact_tuple_sequence_subclass(value: Pair) -> None:
+    match value:
+        case _, str():
+            pass
+        case _:
+            reveal_type(value)  # revealed: Pair
+
+def normalize_nested_record(value: object) -> tuple[None, int, int] | None:
+    match value:
+        case [None, [int()], {}]:
+            return value[0], value[1][0], len(value[2])
+    return None
+
+def unwrap_number_or_label(value: object) -> int | str | None:
+    match value:
+        case [(int() | str()) as item]:
+            return value[0]
+    return None
+
+def test_match_value_sequence(value: object) -> None:
+    match value:
+        case [1]:
+            # Value patterns use equality, so matching `1` does not prove that
+            # the element is an `int`.
+            reveal_type(value[0])  # revealed: object
 ```
 
 ## Value patterns

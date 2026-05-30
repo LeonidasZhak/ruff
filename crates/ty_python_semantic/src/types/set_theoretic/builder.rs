@@ -43,6 +43,7 @@ use crate::types::{
     BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
     LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements, StringLiteralType,
     SubclassOfType, Type, TypeVarBoundOrConstraints, UnionType,
+    refine_tuple_with_exact_sequence_protocol, subtract_exact_sequence_protocol_from_tuple,
 };
 use crate::{Db, FxOrderMap, FxOrderSet};
 use rustc_hash::FxHashSet;
@@ -1219,6 +1220,32 @@ impl<'db> IntersectionBuilder<'db> {
                 self.add_negative_impl(complement.to_intersection(db), seen_aliases)
             }
             _ => {
+                if let Type::ProtocolInstance(protocol) = ty
+                    && let Some(protocol_tuple) = protocol.synthesized_exact_sequence_tuple(self.db)
+                {
+                    let mut distributed = Vec::new();
+
+                    for mut inner in self.intersections {
+                        if let Some(alternatives) =
+                            inner.subtract_exact_sequence_protocol(self.db, protocol_tuple)
+                        {
+                            distributed.extend(alternatives);
+                        } else {
+                            // Preserve a standalone constraint until it is applied to a
+                            // subject. Once a non-tuple positive type is present, keep exact
+                            // negative narrowing tuple-specific rather than leaking the
+                            // synthesized protocol into later narrowing results.
+                            if inner.positive.is_empty() {
+                                inner.add_negative(self.db, ty);
+                            }
+                            distributed.push(inner);
+                        }
+                    }
+
+                    self.intersections = distributed;
+                    return self;
+                }
+
                 for inner in &mut self.intersections {
                     inner.add_negative(self.db, ty);
                 }
@@ -1255,6 +1282,39 @@ struct InnerIntersectionBuilder<'db> {
 }
 
 impl<'db> InnerIntersectionBuilder<'db> {
+    /// Distribute negation of an exact-sequence protocol over tuple positives.
+    ///
+    /// For example, subtracting the pattern `(int(), str())` from
+    /// `tuple[int | str, int | str]` produces alternatives that exclude one
+    /// matching element position at a time.
+    fn subtract_exact_sequence_protocol(
+        &self,
+        db: &'db dyn Db,
+        protocol_tuple: crate::types::tuple::TupleType<'db>,
+    ) -> Option<Vec<Self>> {
+        for (index, existing_positive) in self.positive.iter().enumerate() {
+            let Some(remaining_types) =
+                subtract_exact_sequence_protocol_from_tuple(db, *existing_positive, protocol_tuple)
+            else {
+                continue;
+            };
+
+            let mut alternatives = Vec::with_capacity(remaining_types.len());
+            for remaining in remaining_types {
+                let mut alternative = self.clone();
+                alternative.positive.swap_remove_index(index);
+                alternative.add_positive(db, remaining);
+                if !alternative.positive.contains(&Type::Never) {
+                    alternatives.push(alternative);
+                }
+            }
+
+            return Some(alternatives);
+        }
+
+        None
+    }
+
     /// Return `true` when an intersection excludes every member of an enum class.
     ///
     /// This recognizes enum complements that have become empty, such as
@@ -1422,6 +1482,37 @@ impl<'db> InnerIntersectionBuilder<'db> {
 
                 let addition_is_bool_instance = positive_as_instance
                     .is_some_and(|instance| instance.has_known_class(db, KnownClass::Bool));
+
+                if let Type::ProtocolInstance(protocol) = new_positive
+                    && let Some(protocol_tuple) = protocol.synthesized_exact_sequence_tuple(db)
+                {
+                    for (index, existing_positive) in self.positive.iter().enumerate() {
+                        if let Some(refined) = refine_tuple_with_exact_sequence_protocol(
+                            db,
+                            *existing_positive,
+                            protocol_tuple,
+                        ) {
+                            self.positive.swap_remove_index(index);
+                            self.add_positive(db, refined);
+                            return;
+                        }
+                    }
+                }
+
+                for (index, existing_positive) in self.positive.iter().enumerate() {
+                    if let Type::ProtocolInstance(protocol) = existing_positive
+                        && let Some(protocol_tuple) = protocol.synthesized_exact_sequence_tuple(db)
+                        && let Some(refined) = refine_tuple_with_exact_sequence_protocol(
+                            db,
+                            new_positive,
+                            protocol_tuple,
+                        )
+                    {
+                        self.positive.swap_remove_index(index);
+                        self.add_positive(db, refined);
+                        return;
+                    }
+                }
 
                 for (index, existing_positive) in self.positive.iter().enumerate() {
                     match existing_positive {
