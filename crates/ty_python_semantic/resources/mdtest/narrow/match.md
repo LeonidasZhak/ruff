@@ -216,6 +216,17 @@ def unwrap_single_int(value: object) -> int | None:
             return value[0]
     return None
 
+# This deliberately accepts a small unsoundness: sequence matching can inspect
+# values yielded by `__iter__`, while a later indexed read calls `__getitem__`.
+# Custom `Sequence` implementations and tuple subclasses can override those
+# methods inconsistently. We assume conventional container behavior so exact
+# patterns remain useful for validating parsed data before indexing it.
+def accepted_unsound_indexed_reconstruction(value: Sequence[object]) -> int | None:
+    match value:
+        case [int()]:
+            return value[0]
+    return None
+
 def normalize_counted_label(value: object | None) -> str | None:
     match value:
         case [int(), str()]:

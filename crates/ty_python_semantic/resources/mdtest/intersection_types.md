@@ -696,6 +696,14 @@ class HugeProtocol(Protocol):
     def __len__(self, /) -> Literal[1_000_000_000]: ...
     def __getitem__(self, index: Literal[0], /) -> int: ...
 
+class BoolLengthProtocol(Protocol):
+    def __len__(self, /) -> Literal[True]: ...
+    def __getitem__(self, index: Literal[0], /) -> int: ...
+
+class DefaultedIndexProtocol(Protocol):
+    def __len__(self, /) -> Literal[1]: ...
+    def __getitem__(self, index: Literal[0] = 0, /) -> int: ...
+
 def _(
     positive: Intersection[tuple[int | str, int | str], PairProtocol],
     reversed_positive: Intersection[PairProtocol, tuple[int | str, int | str]],
@@ -714,6 +722,18 @@ def _(
     reveal_type(negative_extended)  # revealed: tuple[int | str, int | str] & ~ExtendedPairProtocol
     reveal_type(non_tuple_negative)  # revealed: list[int] & ~PairProtocol
     reveal_type(huge)  # revealed: tuple[int, ...] & HugeProtocol
+
+def _(bool_length: Intersection[tuple[int | str], BoolLengthProtocol]) -> None:
+    reveal_type(bool_length)  # revealed: Never
+
+def _(negative_bool_length: Intersection[tuple[int | str], Not[BoolLengthProtocol]]) -> None:
+    reveal_type(negative_bool_length)  # revealed: tuple[int | str]
+
+def _(defaulted_index: Intersection[tuple[int | str], DefaultedIndexProtocol]) -> None:
+    reveal_type(defaulted_index)  # revealed: tuple[int | str] & DefaultedIndexProtocol
+
+def _(negative_defaulted_index: Intersection[tuple[int | str], Not[DefaultedIndexProtocol]]) -> None:
+    reveal_type(negative_defaulted_index)  # revealed: tuple[int | str] & ~DefaultedIndexProtocol
 ```
 
 ### Simplifications of `bool`, `AlwaysTruthy` and `AlwaysFalsy`

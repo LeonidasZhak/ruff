@@ -351,16 +351,21 @@ impl<'db> ProtocolInterface<'db> {
         self,
         db: &'db dyn Db,
     ) -> Option<FiniteIndexedProtocolConstraint<'db>> {
-        fn exact_int_like_literal(db: &dyn Db, ty: Type<'_>) -> Option<i64> {
+        fn exact_int_literal(db: &dyn Db, ty: Type<'_>) -> Option<i64> {
             match ty.resolve_type_alias(db) {
                 Type::Union(union) => {
-                    let mut elements = union.elements(db).iter();
-                    let first = exact_int_like_literal(db, *elements.next()?)?;
+                    let elements = union.elements(db);
+                    let first = elements
+                        .iter()
+                        .find_map(|element| element.resolve_type_alias(db).as_int_literal())?;
                     elements
-                        .all(|element| exact_int_like_literal(db, *element) == Some(first))
+                        .iter()
+                        .all(|element| {
+                            element.resolve_type_alias(db).as_int_like_literal() == Some(first)
+                        })
                         .then_some(first)
                 }
-                ty => ty.as_int_like_literal(),
+                ty => ty.as_int_literal(),
             }
         }
 
@@ -378,7 +383,7 @@ impl<'db> ProtocolInterface<'db> {
             return None;
         }
 
-        let length = usize::try_from(exact_int_like_literal(db, len_signature.return_ty)?).ok()?;
+        let length = usize::try_from(exact_int_literal(db, len_signature.return_ty)?).ok()?;
         if length == 0 {
             return Some(FiniteIndexedProtocolConstraint {
                 element_types: Box::default(),
@@ -396,14 +401,14 @@ impl<'db> ProtocolInterface<'db> {
             let [self_parameter, index_parameter] = signature.parameters().as_slice() else {
                 return None;
             };
-            if !self_parameter.is_positional_only() || !index_parameter.is_positional_only() {
+            if !self_parameter.is_positional_only()
+                || !index_parameter.is_positional_only()
+                || index_parameter.default_type().is_some()
+            {
                 return None;
             }
-            let index = usize::try_from(exact_int_like_literal(
-                db,
-                index_parameter.annotated_type(),
-            )?)
-            .ok()?;
+            let index =
+                usize::try_from(exact_int_literal(db, index_parameter.annotated_type())?).ok()?;
             if index >= length || elements.insert(index, signature.return_ty).is_some() {
                 return None;
             }
