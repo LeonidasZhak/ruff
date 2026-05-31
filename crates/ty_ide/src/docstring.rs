@@ -6,6 +6,8 @@
 //! There are no formal specifications for any of these formats, so the parsing
 //! logic needs to be tolerant of variations.
 
+mod markdown;
+
 use regex::Regex;
 use ruff_python_trivia::{PythonWhitespace, leading_indentation};
 use ruff_source_file::UniversalNewlines;
@@ -258,43 +260,30 @@ fn render_markdown(docstring: &str) -> String {
         }
 
         // If we're not in a codeblock and we see a markdown codefence, start one
-        let has_tick_fence = line.starts_with("```");
-        let has_tilde_fence = line.starts_with("~~~");
-        if !in_any_code && (has_tick_fence || has_tilde_fence) {
-            let without_leading_fence = if has_tick_fence {
-                line.trim_start_matches('`')
-            } else {
-                line.trim_start_matches('~')
-            };
-            let fence_len = line.len() - without_leading_fence.len();
-            let fence = &line[..fence_len];
-            // If we don't see this amount of ticks again on the line, assume we're opening a markdown block
-            // (We *don't* want to consider ```hello``` as a codefence, that's inline code!)
-            if !without_leading_fence.contains(fence) {
-                // Unlike other blocks we don't need to emit fences because it's already markdown
-                block_indent = line_indent;
-                in_any_code = true;
-                in_markdown_with_fence = Some(fence.to_owned());
-                // Render the line verbatim without its indent and move on.
-                //
-                // If there's any indent this is really just Bad Syntax but it "makes sense"
-                // to someone writing docs like this:
-                //
-                // Returns:
-                //     Some details...
-                //     ```
-                //     some_example()
-                //     ```
-                //     etc etc...
-                //
-                // We "make this work" by stripping the indent on the fences but preserving the
-                // full indent of the lines between the fences
-                output.push_str(line);
-                continue;
-            }
+        if !in_any_code && let Some(fence) = markdown::fence_start(line) {
+            // Unlike other blocks we don't need to emit fences because it's already markdown
+            block_indent = line_indent;
+            in_any_code = true;
+            in_markdown_with_fence = Some(fence.to_owned());
+            // Render the line verbatim without its indent and move on.
+            //
+            // If there's any indent this is really just Bad Syntax but it "makes sense"
+            // to someone writing docs like this:
+            //
+            // Returns:
+            //     Some details...
+            //     ```
+            //     some_example()
+            //     ```
+            //     etc etc...
+            //
+            // We "make this work" by stripping the indent on the fences but preserving the
+            // full indent of the lines between the fences
+            output.push_str(line);
+            continue;
         // If we're in a markdown code fence and this line seems to terminate it, end the block
         } else if let Some(fence) = &in_markdown_with_fence
-            && line.starts_with(fence)
+            && markdown::closes_fence(line, fence)
         {
             in_any_code = false;
             block_indent = 0;
