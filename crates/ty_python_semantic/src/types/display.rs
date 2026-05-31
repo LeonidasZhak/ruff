@@ -903,7 +903,7 @@ impl<'db> FmtDetailed<'db> for DisplayRepresentation<'db> {
                     f.with_type(Type::SpecialForm(SpecialFormType::Protocol))
                         .write_str("Protocol")?;
                     f.write_str(" with members ")?;
-                    let interface = synthetic.interface(self.db);
+                    let interface = synthetic.interface();
                     let member_list = interface.members(self.db);
                     let num_members = member_list.len();
                     for (i, member) in member_list.enumerate() {

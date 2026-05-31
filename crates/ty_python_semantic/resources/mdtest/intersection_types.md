@@ -670,6 +670,52 @@ def _(
     reveal_type(i8)  # revealed: Never
 ```
 
+### Finite indexed protocol constraints
+
+A protocol with a literal `__len__` return type and one indexed `__getitem__` overload per element
+provides finite indexed constraints. Intersecting those constraints with an exact tuple refines each
+element; subtracting a protocol fully described by those constraints produces the remaining tuple
+alternatives. A protocol with additional members remains in the intersection after tuple refinement,
+and its negation remains symbolic.
+
+```py
+from typing_extensions import Literal, Protocol, overload
+from ty_extensions import Intersection, Not
+
+class PairProtocol(Protocol):
+    def __len__(self, /) -> Literal[2]: ...
+    @overload
+    def __getitem__(self, index: Literal[0], /) -> int: ...
+    @overload
+    def __getitem__(self, index: Literal[1], /) -> str: ...
+
+class ExtendedPairProtocol(PairProtocol, Protocol):
+    def extra(self, /) -> None: ...
+
+class HugeProtocol(Protocol):
+    def __len__(self, /) -> Literal[1_000_000_000]: ...
+    def __getitem__(self, index: Literal[0], /) -> int: ...
+
+def _(
+    positive: Intersection[tuple[int | str, int | str], PairProtocol],
+    reversed_positive: Intersection[PairProtocol, tuple[int | str, int | str]],
+    negative: Intersection[tuple[int | str, int | str], Not[PairProtocol]],
+    extended: Intersection[tuple[int | str, int | str], ExtendedPairProtocol],
+    reversed_extended: Intersection[ExtendedPairProtocol, tuple[int | str, int | str]],
+    negative_extended: Intersection[tuple[int | str, int | str], Not[ExtendedPairProtocol]],
+    non_tuple_negative: Intersection[list[int], Not[PairProtocol]],
+    huge: Intersection[tuple[int, ...], HugeProtocol],
+) -> None:
+    reveal_type(positive)  # revealed: tuple[int, str]
+    reveal_type(reversed_positive)  # revealed: tuple[int, str]
+    reveal_type(negative)  # revealed: tuple[str, int | str] | tuple[int | str, int]
+    reveal_type(extended)  # revealed: tuple[int, str] & ExtendedPairProtocol
+    reveal_type(reversed_extended)  # revealed: ExtendedPairProtocol & tuple[int, str]
+    reveal_type(negative_extended)  # revealed: tuple[int | str, int | str] & ~ExtendedPairProtocol
+    reveal_type(non_tuple_negative)  # revealed: list[int] & ~PairProtocol
+    reveal_type(huge)  # revealed: tuple[int, ...] & HugeProtocol
+```
+
 ### Simplifications of `bool`, `AlwaysTruthy` and `AlwaysFalsy`
 
 In general, intersections with `AlwaysTruthy` and `AlwaysFalsy` cannot be simplified. Naively, you

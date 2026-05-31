@@ -7,7 +7,7 @@ use ruff_python_ast::PythonVersion;
 use ruff_python_ast::name::Name;
 use ty_module_resolver::{ModuleName, file_to_module};
 
-use super::protocol_class::ProtocolInterface;
+use super::protocol_class::{FiniteIndexedProtocolConstraint, ProtocolInterface};
 use super::{
     BoundTypeVarInstance, ClassType, DivergentType, KnownClass, MaterializationKind,
     SubclassOfType, Type, TypeVarVariance,
@@ -145,7 +145,7 @@ impl<'db> Type<'db> {
         M: IntoIterator<Item = (&'a str, Type<'db>)>,
     {
         Self::ProtocolInstance(ProtocolInstanceType::synthesized(
-            SynthesizedProtocolType::new(db, ProtocolInterface::with_property_members(db, members)),
+            SynthesizedProtocolType::new(ProtocolInterface::with_property_members(db, members)),
         ))
     }
 
@@ -155,29 +155,7 @@ impl<'db> Type<'db> {
         M: IntoIterator<Item = (&'a str, CallableType<'db>)>,
     {
         Self::ProtocolInstance(ProtocolInstanceType::synthesized(
-            SynthesizedProtocolType::new(db, ProtocolInterface::with_methods(db, methods)),
-        ))
-    }
-
-    /// Synthesize a protocol instance for an exact sequence pattern.
-    ///
-    /// The structural methods describe the runtime protocol, while `tuple`
-    /// records the fixed element shape so tuple intersections can refine or
-    /// subtract that shape without recovering it from the methods.
-    pub(super) fn exact_sequence_protocol_with_methods<'a, M>(
-        db: &'db dyn Db,
-        methods: M,
-        tuple: TupleType<'db>,
-    ) -> Self
-    where
-        M: IntoIterator<Item = (&'a str, CallableType<'db>)>,
-    {
-        Self::ProtocolInstance(ProtocolInstanceType::synthesized(
-            SynthesizedProtocolType::exact_sequence(
-                db,
-                ProtocolInterface::with_methods(db, methods),
-                tuple,
-            ),
+            SynthesizedProtocolType::new(ProtocolInterface::with_methods(db, methods)),
         ))
     }
 }
@@ -679,7 +657,7 @@ pub(super) fn walk_protocol_instance_type<'db, V: super::visitor::TypeVisitor<'d
                 }
             }
             Protocol::Synthesized(synthesized) => {
-                walk_protocol_interface(db, synthesized.interface(db), visitor);
+                walk_protocol_interface(db, synthesized.interface(), visitor);
             }
         }
     }
@@ -704,15 +682,16 @@ impl<'db> ProtocolInstanceType<'db> {
         }
     }
 
-    /// Return the tuple shape carried by an exact-sequence synthesized protocol.
-    pub(super) fn synthesized_exact_sequence_tuple(
+    /// Return the finite indexed constraints described by this protocol's methods, if any.
+    pub(super) fn finite_indexed_constraint(
         self,
         db: &'db dyn Db,
-    ) -> Option<TupleType<'db>> {
-        match self.inner {
-            Protocol::Synthesized(synthesized) => synthesized.exact_sequence_tuple(db),
-            Protocol::FromClass(_) => None,
-        }
+    ) -> Option<FiniteIndexedProtocolConstraint<'db>> {
+        self.interface(db).finite_indexed_constraint(db)
+    }
+
+    pub(super) const fn is_synthesized(self) -> bool {
+        self.inner.is_synthesized()
     }
 
     /// If this is a class-based protocol, convert the protocol-instance into a nominal instance.
@@ -800,9 +779,7 @@ impl<'db> ProtocolInstanceType<'db> {
     pub(crate) fn instance_member(self, db: &'db dyn Db, name: &str) -> PlaceAndQualifiers<'db> {
         match self.inner {
             Protocol::FromClass(class) => class.instance_member(db, name),
-            Protocol::Synthesized(synthesized) => {
-                synthesized.interface(db).instance_member(db, name)
-            }
+            Protocol::Synthesized(synthesized) => synthesized.interface().instance_member(db, name),
         }
     }
 
@@ -864,7 +841,7 @@ impl<'db> Protocol<'db> {
     fn interface(self, db: &'db dyn Db) -> ProtocolInterface<'db> {
         match self {
             Self::FromClass(class) => class.interface(db),
-            Self::Synthesized(synthesized) => synthesized.interface(db),
+            Self::Synthesized(synthesized) => synthesized.interface(),
         }
     }
 
@@ -902,7 +879,6 @@ impl<'db> VarianceInferable<'db> for Protocol<'db> {
 
 mod synthesized_protocol {
     use crate::types::protocol_class::ProtocolInterface;
-    use crate::types::tuple::TupleType;
     use crate::types::{
         ApplyTypeMappingVisitor, BoundTypeVarInstance, FindLegacyTypeVarsVisitor, Type,
         TypeContext, TypeMapping, TypeVarVariance, VarianceInferable,
@@ -911,28 +887,12 @@ mod synthesized_protocol {
     use ty_python_core::definition::Definition;
 
     /// A "synthesized" protocol type that is dissociated from a class definition in source code.
-    #[salsa::interned(debug, constructor=new_internal, heap_size=ruff_memory_usage::heap_size)]
-    pub(in crate::types) struct SynthesizedProtocolType<'db> {
-        pub(in crate::types) interface: ProtocolInterface<'db>,
-        pub(super) exact_sequence_tuple: Option<TupleType<'db>>,
-    }
-
-    // The Salsa heap is tracked separately.
-    impl get_size2::GetSize for SynthesizedProtocolType<'_> {}
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
+    pub(in crate::types) struct SynthesizedProtocolType<'db>(ProtocolInterface<'db>);
 
     impl<'db> SynthesizedProtocolType<'db> {
-        pub(super) fn new(db: &'db dyn Db, interface: ProtocolInterface<'db>) -> Self {
-            Self::new_internal(db, interface, None)
-        }
-
-        /// Construct a synthesized protocol whose interface describes an exact
-        /// sequence pattern and whose payload remembers the equivalent tuple.
-        pub(super) fn exact_sequence(
-            db: &'db dyn Db,
-            interface: ProtocolInterface<'db>,
-            tuple: TupleType<'db>,
-        ) -> Self {
-            Self::new_internal(db, interface, Some(tuple))
+        pub(super) fn new(interface: ProtocolInterface<'db>) -> Self {
+            Self(interface)
         }
 
         pub(super) fn apply_type_mapping_impl<'a>(
@@ -942,13 +902,9 @@ mod synthesized_protocol {
             tcx: TypeContext<'db>,
             visitor: &ApplyTypeMappingVisitor<'db>,
         ) -> Self {
-            Self::new_internal(
-                db,
-                self.interface(db)
+            Self(
+                self.0
                     .apply_type_mapping_impl(db, type_mapping, tcx, visitor),
-                self.exact_sequence_tuple(db).and_then(|tuple| {
-                    tuple.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
-                }),
             )
         }
 
@@ -959,8 +915,12 @@ mod synthesized_protocol {
             typevars: &mut FxOrderSet<BoundTypeVarInstance<'db>>,
             visitor: &FindLegacyTypeVarsVisitor<'db>,
         ) {
-            self.interface(db)
+            self.0
                 .find_legacy_typevars_impl(db, binding_context, typevars, visitor);
+        }
+
+        pub(in crate::types) fn interface(self) -> ProtocolInterface<'db> {
+            self.0
         }
 
         pub(in crate::types) fn recursive_type_normalized_impl(
@@ -969,12 +929,8 @@ mod synthesized_protocol {
             div: Type<'db>,
             nested: bool,
         ) -> Option<Self> {
-            Some(Self::new_internal(
-                db,
-                self.interface(db)
-                    .recursive_type_normalized_impl(db, div, nested)?,
-                self.exact_sequence_tuple(db)
-                    .and_then(|tuple| tuple.recursive_type_normalized_impl(db, div, nested)),
+            Some(Self(
+                self.0.recursive_type_normalized_impl(db, div, nested)?,
             ))
         }
     }
@@ -985,7 +941,7 @@ mod synthesized_protocol {
             db: &'db dyn Db,
             typevar: BoundTypeVarInstance<'db>,
         ) -> TypeVarVariance {
-            self.interface(db).variance_of(db, typevar)
+            self.0.variance_of(db, typevar)
         }
     }
 }

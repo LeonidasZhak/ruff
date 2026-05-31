@@ -34,10 +34,7 @@ pub(crate) use self::infer::{
 pub(crate) use self::iteration::extract_fixed_length_iterable_element_types;
 pub use self::known_instance::KnownInstanceType;
 pub(crate) use self::relation_error::{ErrorContext, ErrorContextTree, ParameterDescription};
-pub(crate) use self::sequence_pattern::{
-    exact_sequence_pattern_type, refine_tuple_with_exact_sequence_protocol, sequence_pattern_type,
-    subtract_exact_sequence_protocol_from_tuple,
-};
+pub(crate) use self::sequence_pattern::{exact_sequence_pattern_type, sequence_pattern_type};
 use self::set_theoretic::KnownUnion;
 pub(crate) use self::set_theoretic::builder::{
     IntersectionBuilder, UnionAccumulator, UnionBuilder,
@@ -3531,7 +3528,7 @@ impl<'db> Type<'db> {
                 inner: Protocol::Synthesized(protocol),
                 ..
             }) if policy.mro_no_object_fallback()
-                && !protocol.interface(db).includes_member(db, name_str) =>
+                && !protocol.interface().includes_member(db, name_str) =>
             {
                 Place::Undefined.into()
             }

@@ -238,6 +238,13 @@ def test_match_exact_tuple_sequence_is_exhaustive(value: int | tuple[int, int]) 
         case _:
             assert_never(value)
 
+def test_match_exact_mutable_sequence_negative(value: list[int]) -> None:
+    match value:
+        case [int()]:
+            pass
+        case _:
+            reveal_type(value)  # revealed: list[int]
+
 class Pair(NamedTuple):
     left: int | str
     right: int | str

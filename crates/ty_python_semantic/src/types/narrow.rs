@@ -2050,16 +2050,20 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         let subject = PlaceExpr::try_from_expr(subject.node_ref(self.db).node(self.module))?;
         let place = self.expect_place(&subject);
 
-        let ty = match singleton {
-            ast::Singleton::None => Type::none(self.db),
-            ast::Singleton::True => Type::bool_literal(true),
-            ast::Singleton::False => Type::bool_literal(false),
-        };
+        let ty = self.match_pattern_singleton_type(singleton);
         let ty = ty.negate_if(self.db, !is_positive);
         Some(NarrowingConstraints::from_iter([(
             place,
             NarrowingConstraint::intersection(ty),
         )]))
+    }
+
+    fn match_pattern_singleton_type(&self, singleton: ast::Singleton) -> Type<'db> {
+        match singleton {
+            ast::Singleton::None => Type::none(self.db),
+            ast::Singleton::True => Type::bool_literal(true),
+            ast::Singleton::False => Type::bool_literal(false),
+        }
     }
 
     fn evaluate_match_pattern_class(
@@ -2130,11 +2134,9 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     /// values cannot fall outside it.
     fn necessary_match_pattern_type(&self, pattern: &PatternPredicateKind<'db>) -> Type<'db> {
         match pattern {
-            PatternPredicateKind::Singleton(singleton) => match singleton {
-                ast::Singleton::None => Type::none(self.db),
-                ast::Singleton::True => Type::bool_literal(true),
-                ast::Singleton::False => Type::bool_literal(false),
-            },
+            PatternPredicateKind::Singleton(singleton) => {
+                self.match_pattern_singleton_type(*singleton)
+            }
             PatternPredicateKind::Class(cls, _) => {
                 match infer_same_file_expression_type(self.db, *cls, TypeContext::default()) {
                     Type::ClassLiteral(class) => {
@@ -2168,11 +2170,9 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     /// rather than excluding values that might fail the pattern at runtime.
     fn definite_match_pattern_type(&self, pattern: &PatternPredicateKind<'db>) -> Type<'db> {
         match pattern {
-            PatternPredicateKind::Singleton(singleton) => match singleton {
-                ast::Singleton::None => Type::none(self.db),
-                ast::Singleton::True => Type::bool_literal(true),
-                ast::Singleton::False => Type::bool_literal(false),
-            },
+            PatternPredicateKind::Singleton(singleton) => {
+                self.match_pattern_singleton_type(*singleton)
+            }
             PatternPredicateKind::Value(value) => {
                 let ty = infer_same_file_expression_type(self.db, *value, TypeContext::default());
                 if ty.is_single_valued(self.db) {
