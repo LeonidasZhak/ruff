@@ -11,7 +11,8 @@ use crate::types::callable::walk_callable_type;
 use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
 use crate::types::constraints::{
-    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBounds, Solutions,
+    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBounds,
+    SolutionProjection, Solutions,
 };
 use crate::types::infer::original_class_type;
 use crate::types::relation::{
@@ -1908,12 +1909,10 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         // was not enough: `solutions_with` still performed the expensive path traversal, and the
         // skipped projection changed precision in LiteralString tests. See the
         // `ty_micro[pydantic_core_schema_dict]` benchmark for a minimized reproducer.
-        let pending = self
-            .pending
-            .remove_noninferable(self.db, self.constraints, self.inferable);
-        let solutions = match pending.solutions_with(
+        let solutions = match self.pending.solutions_with(
             self.db,
             self.constraints,
+            SolutionProjection::InferableOnly(self.inferable),
             |typevar, _variance, lower, upper| {
                 if let Some(ty) = choose(typevar, Some((lower, upper))) {
                     return Ok(Some(ty));
@@ -2270,8 +2269,11 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         &mut self,
         set: ConstraintSet<'db, 'c>,
     ) -> Result<(), ()> {
-        let set = set.remove_noninferable(self.db, self.constraints, self.inferable);
-        let solutions = match set.solutions(self.db, self.constraints) {
+        let solutions = match set.solutions(
+            self.db,
+            self.constraints,
+            SolutionProjection::InferableOnly(self.inferable),
+        ) {
             Solutions::Unsatisfiable => return Err(()),
             Solutions::Unconstrained => return Ok(()),
             Solutions::Constrained(solutions) => solutions,
